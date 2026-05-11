@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BankFinder</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+    * { font-family: 'Inter', sans-serif; }
+
+    .fade-up { animation: fadeUp 0.22s ease forwards; }
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .spinner {
+      width: 18px; height: 18px;
+      border: 2px solid #1e2030;
+      border-top-color: #94a3b8;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      display: inline-block;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Toast */
+    #toast {
+      position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%) translateY(16px);
+      background: #1e1e2e; color: #f87171;
+      padding: 10px 20px; border-radius: 10px;
+      font-size: 13px; white-space: nowrap;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.2s, transform 0.2s;
+      z-index: 100;
+    }
+    #toast.show {
+      opacity: 1; transform: translateX(-50%) translateY(0);
+    }
+
+    /* Searchable dropdown */
+    .bank-dropdown { position: relative; }
+    .bank-options {
+      position: absolute; top: calc(100% + 6px); left: 0; right: 0;
+      background: #111118; border-radius: 10px;
+      max-height: 220px; overflow-y: auto;
+      z-index: 50;
+      scrollbar-width: thin; scrollbar-color: #1e1e2e transparent;
+    }
+    .bank-options::-webkit-scrollbar { width: 4px; }
+    .bank-options::-webkit-scrollbar-thumb { background: #1e1e2e; border-radius: 4px; }
+    .bank-option {
+      padding: 10px 14px; font-size: 13px; color: #cbd5e1; cursor: pointer;
+      transition: background 0.1s;
+    }
+    .bank-option:hover, .bank-option.active { background: #1a1a28; color: #fff; }
+    .bank-option.no-result { color: #475569; cursor: default; }
+    .bank-option.no-result:hover { background: transparent; }
+  </style>
+</head>
+<body class="bg-[#0a0a0f] min-h-screen flex items-center justify-center px-4">
+
+  <div id="toast"></div>
+
+  <div class="w-full max-w-sm flex flex-col items-center gap-8">
+
+    <div class="text-center">
+      <h1 class="text-white text-2xl font-semibold tracking-tight">BankFinder</h1>
+      <p class="text-slate-500 text-sm mt-1">Nigerian Account Resolver</p>
+    </div>
+
+    <div class="w-full">
+      <input
+        id="account-input"
+        type="text"
+        inputmode="numeric"
+        maxlength="10"
+        placeholder="Enter 10-digit account number"
+        autocomplete="off"
+        class="w-full bg-[#111118] text-white text-center text-lg tracking-widest rounded-xl px-5 py-4 placeholder:text-slate-600 placeholder:tracking-normal placeholder:text-sm focus:outline-none transition-colors"
+      />
+    </div>
+
+    <div id="result" class="w-full"></div>
+
+  </div>
+
+  <script>
+    const input   = document.getElementById('account-input');
+    const resultEl = document.getElementById('result');
+    const toastEl  = document.getElementById('toast');
+
+    let debounceTimer = null;
+    let lastQuery = '';
+    let banks = [];
+    let currentAcct = '';
+    let toastTimer = null;
+
+    // ── Toast ────────────────────────────────────────────────────────────────
+    function showToast(msg) {
+      clearTimeout(toastTimer);
+      toastEl.textContent = msg;
+      toastEl.classList.add('show');
+      toastTimer = setTimeout(() => toastEl.classList.remove('show'), 3000);
+    }
+
+    // ── Input ────────────────────────────────────────────────────────────────
+    input.addEventListener('input', () => {
+      const val = input.value.replace(/\D/g, '').slice(0, 10);
+      input.value = val;
+
+      if (val.length < 10) {
+        resultEl.innerHTML = '';
+        lastQuery = '';
+        clearTimeout(debounceTimer);
+        return;
+      }
+
+      if (val === lastQuery) return;
+      lastQuery = val;
+
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => resolve(val), 300);
+    });
+
+    // ── Bank list ────────────────────────────────────────────────────────────
+    async function loadBanks() {
+      if (banks.length) return;
+      try {
+        const res  = await fetch('/account-resolver/banks');
+        const json = await res.json();
+        if (json.success) banks = json.data;
+      } catch {}
+    }
+
+    // ── Resolve (auto) ───────────────────────────────────────────────────────
+    async function resolve(accountNumber) {
+      currentAcct = accountNumber;
+      showLoading();
+      await loadBanks();
+      const t0 = performance.now();
+      try {
+        const res  = await fetch(`/account-resolver/resolve?accountNumber=${accountNumber}`);
+        const json = await res.json();
+        const ms   = Math.round(performance.now() - t0);
+
+        if (json.success && json.data) {
+          showResult(json.data, ms);
+        } else {
+          showNotFound();
+        }
+      } catch {
+        showToast('Network error. Please try again.');
+        resultEl.innerHTML = '';
+      }
+    }
+
+    // ── Manual bank lookup ───────────────────────────────────────────────────
+    async function lookupWithBank(bankCode, bankName) {
+      if (!currentAcct) return;
+      showLoading();
+      const t0 = performance.now();
+      try {
+        const res  = await fetch('/account-resolver/lookup-account-name', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ bankCode, accountNumber: currentAcct }),
+        });
+        const json = await res.json();
+        const ms   = Math.round(performance.now() - t0);
+
+        if (json.success && json.data) {
+          showResult({
+            ...json.data,
+            bankCode,
+            bankName: json.data.bankName && json.data.bankName !== 'Unknown Bank'
+              ? json.data.bankName
+              : bankName,
+          }, ms);
+        } else {
+          showToast(json.message || `No account found at ${bankName}.`);
+          showNotFound();
+        }
+      } catch {
+        showToast('Network error. Please try again.');
+      }
+    }
+
+    // ── Searchable bank picker ───────────────────────────────────────────────
+    function buildBankPicker(selectedCode = '') {
+      return `
+        <div class="bank-dropdown">
+          <input
+            id="bank-search"
+            type="text"
+            placeholder="Search bank…"
+            autocomplete="off"
+            class="w-full bg-[#111118] text-slate-300 text-sm rounded-lg px-3 py-2.5 focus:outline-none placeholder:text-slate-600"
+          />
+          <div id="bank-options" class="bank-options hidden"></div>
+        </div>
+        <button id="bank-retry-btn"
+          class="w-full bg-[#111118] hover:bg-[#191926] text-slate-300 text-sm rounded-lg py-2.5 transition-colors">
+          Try this bank
+        </button>`;
+    }
+
+    function attachBankPicker(selectedCode = '') {
+      const searchEl  = document.getElementById('bank-search');
+      const optionsEl = document.getElementById('bank-options');
+      const retryBtn  = document.getElementById('bank-retry-btn');
+      if (!searchEl || !optionsEl || !retryBtn) return;
+
+      let selected = banks.find(b => b.code === selectedCode) || null;
+      if (selected) searchEl.value = selected.name;
+
+      function renderOptions(filter) {
+        const q = filter.trim().toLowerCase();
+        const matches = q
+          ? banks.filter(b => b.name.toLowerCase().includes(q))
+          : banks;
+
+        if (!matches.length) {
+          optionsEl.innerHTML = `<div class="bank-option no-result">No banks found</div>`;
+        } else {
+          optionsEl.innerHTML = matches.map(b =>
+            `<div class="bank-option${b.code === selected?.code ? ' active' : ''}" data-code="${esc(b.code)}" data-name="${esc(b.name)}">${esc(b.name)}</div>`
+          ).join('');
+        }
+
+        optionsEl.querySelectorAll('.bank-option[data-code]').forEach(el => {
+          el.addEventListener('mousedown', e => {
+            e.preventDefault();
+            selected = { code: el.dataset.code, name: el.dataset.name };
+            searchEl.value = selected.name;
+            optionsEl.classList.add('hidden');
+          });
+        });
+      }
+
+      searchEl.addEventListener('focus', () => {
+        renderOptions(searchEl.value);
+        optionsEl.classList.remove('hidden');
+      });
+      searchEl.addEventListener('input', () => {
+        selected = null;
+        renderOptions(searchEl.value);
+        optionsEl.classList.remove('hidden');
+      });
+      searchEl.addEventListener('blur', () => {
+        setTimeout(() => optionsEl.classList.add('hidden'), 150);
+      });
+
+      retryBtn.addEventListener('click', () => {
+        if (!selected) { showToast('Select a bank first.'); return; }
+        lookupWithBank(selected.code, selected.name);
+      });
+    }
+
+    // ── Views ────────────────────────────────────────────────────────────────
+    function showLoading() {
+      resultEl.innerHTML = `
+        <div class="flex justify-center py-4">
+          <span class="spinner"></span>
+        </div>`;
+    }
+
+    function showResult(data, ms) {
+      resultEl.innerHTML = `
+        <div class="fade-up bg-[#111118] rounded-xl px-5 py-5 flex flex-col gap-3">
+          <div class="flex flex-col gap-0.5">
+            <span class="text-slate-500 text-xs uppercase tracking-widest">Account Name</span>
+            <span class="text-white text-base font-medium">${esc(data.accountName)}</span>
+          </div>
+          <div class="h-px bg-[#1a1a28]"></div>
+          <div class="flex justify-between items-end">
+            <div class="flex flex-col gap-0.5">
+              <span class="text-slate-500 text-xs uppercase tracking-widest">Bank</span>
+              <span class="text-white text-sm font-medium">${esc(data.bankName)}</span>
+            </div>
+            <span class="text-slate-600 text-xs font-mono">${esc(data.bankCode)}</span>
+          </div>
+          <div class="h-px bg-[#1a1a28]"></div>
+          <div class="flex justify-between items-center">
+            <button id="wrong-bank-btn" class="text-orange-500 hover:text-orange-400 text-xs transition-colors">
+              Not correct bank?
+            </button>
+            <span class="text-slate-600 text-xs">${ms < 1000 ? ms + 'ms' : (ms/1000).toFixed(2) + 's'}</span>
+          </div>
+          <div id="bank-selector-slot" class="flex flex-col gap-2"></div>
+        </div>`;
+
+      document.getElementById('wrong-bank-btn').addEventListener('click', function () {
+        const slot = document.getElementById('bank-selector-slot');
+        if (slot.innerHTML) { slot.innerHTML = ''; return; }
+        slot.innerHTML = buildBankPicker(data.bankCode);
+        attachBankPicker(data.bankCode);
+      });
+    }
+
+    function showNotFound() {
+      resultEl.innerHTML = `
+        <div class="fade-up bg-[#111118] rounded-xl px-5 py-5 flex flex-col gap-3">
+          <p class="text-slate-500 text-sm text-center">No bank found. Know the bank? Select it below.</p>
+          <div class="h-px bg-[#1a1a28]"></div>
+          ${buildBankPicker()}
+        </div>`;
+      attachBankPicker();
+    }
+
+    function esc(str) {
+      return String(str)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+  </script>
+</body>
+</html>

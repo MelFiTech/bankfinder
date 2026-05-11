@@ -7,41 +7,36 @@ export class AccountResolverController {
 
   constructor(private readonly accountResolverService: AccountResolverService) {}
 
+  @Get('banks')
+  getBanks() {
+    return { success: true, data: this.accountResolverService.getBanks() };
+  }
+
   @Get('resolve')
   async resolveBank(@Query('accountNumber') accountNumber: string) {
     try {
-      const startTime = Date.now();
-      const potentialBanks = await this.accountResolverService.resolveBank(accountNumber);
-      const elapsedTime = Date.now() - startTime;
+      const result = await this.accountResolverService.resolveBankAndAccount(accountNumber);
 
-      if (elapsedTime > 2000) {
+      if (!result) {
+        this.logger.warn(`No bank/account match for account number ${accountNumber}`);
         return {
           success: false,
-          message: "Bank resolution exceeded 2 seconds",
-          data: []
-        };
-      }
-
-      if (potentialBanks.length === 0) {
-        this.logger.warn(`No banks found for account number ${accountNumber}`);
-        return {
-          success: false,
-          message: "No banks identified for the given account number.",
-          data: []
+          message: 'No bank identified for this account number, or account could not be resolved.',
+          data: null,
         };
       }
 
       return {
         success: true,
-        message: `Found ${potentialBanks.length} bank(s) for the given account number`,
-        data: potentialBanks
+        message: 'Bank and account resolved.',
+        data: result,
       };
     } catch (error) {
       this.logger.error(`Error resolving bank: ${error.message}`);
       return {
         success: false,
         message: `Error resolving bank: ${error.message}`,
-        data: []
+        data: null,
       };
     }
   }

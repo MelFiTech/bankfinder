@@ -1,85 +1,148 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Bankfinder
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+**Bankfinder** is a small [NestJS](https://nestjs.com/) service that helps you figure out **which Nigerian bank** a **10-digit NUBAN** account number belongs to, and returns the **account holder name** in one step. It talks to an **upstream banking API** (bank catalogue + account resolve) and optionally **PostgreSQL** (via [Prisma](https://www.prisma.io/)) to remember past resolutions.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://coveralls.io/github/nestjs/nest?branch=master" target="_blank"><img src="https://coveralls.io/repos/github/nestjs/nest/badge.svg?branch=master#9" alt="Coverage" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+This project is intended to be **open source**: fork it, self-host it, and swap or extend integrations as you like.
 
-## Description
+---
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## Why it exists
+
+Resolving “which bank is this account?” is awkward when you only have an account number. Different integrations expose bank lists and name-enquiry APIs in different shapes. Bankfinder:
+
+1. Pulls the **authoritative bank list** from the configured integration.
+2. Maps your **priority bank labels** to that list (fuzzy name match) so **bank codes always come from the live catalogue**, not hardcoded guesswork.
+3. Calls the integration’s **account resolve** API to see which bank actually recognises the account.
+4. Returns **`bankCode`**, **`bankName`**, and **`accountName`** together.
+
+It also applies **NUBAN prefix** rules where a 3-digit prefix clearly identifies a commercial bank, so the resolver does not “race” every digital bank against a traditional bank and pick the wrong winner.
+
+---
+
+## How it works (high level)
+
+```mermaid
+flowchart LR
+  subgraph inputs [Input]
+    N[accountNumber]
+  end
+  subgraph cache [Caches]
+    M[In-memory LRU]
+    D[(PostgreSQL ResolvedAccount)]
+  end
+  subgraph live [Live path]
+    S[Fetch bank catalogue]
+    R[Resolve account per bank]
+  end
+  N --> M
+  M -->|miss| D
+  D -->|miss| S
+  S --> candidates[Build candidate banks]
+  candidates --> R
+  R -->|first success| out[bankCode + bankName + accountName]
+  out --> M
+  out --> D
+```
+
+1. **Fetch the bank catalogue** (cached ~1 hour). Priority names in code are matched to catalogue rows; every other bank returned by the integration is appended so nothing is silently omitted.
+2. **Resolve**  
+   - If the account’s **first 3 digits** match a known **NUBAN sort-code prefix**, only the mapped bank is queried (avoids false positives when several endpoints “accept” the same number).  
+   - Otherwise, candidates are ordered with **priority banks first**, then the rest; **`Promise.any`** runs resolve calls in parallel and takes the **first successful** response (with a per-call timeout).
+3. **Caching**  
+   - Short **in-memory** cache for hot account numbers.  
+   - **Prisma** `ResolvedAccount` table: upsert after a live hit so restarts and repeat lookups avoid hammering the API.
+
+---
+
+## API
+
+Default HTTP port: **`3001`**. OpenAPI / Swagger UI: **`/api`**.
+
+| Method | Path | Purpose |
+|--------|------|--------|
+| `GET` | `/account-resolver/banks` | Cached list of banks (code + label) used for resolution. |
+| `GET` | `/account-resolver/resolve?accountNumber=` | **Single call**: resolve bank + account name (or failure). |
+| `POST` | `/account-resolver/lookup-account-name` | Body: `{ "bankCode", "accountNumber" }` — resolve when you already know the bank code. |
+
+**Successful resolve** (`GET …/resolve`) returns JSON like:
+
+```json
+{
+  "success": true,
+  "message": "Bank and account resolved.",
+  "data": {
+    "bankCode": "000000",
+    "bankName": "Example Bank Ltd",
+    "accountName": "JANE DOE"
+  }
+}
+```
+
+---
+
+## Configuration
+
+Create a `.env` (see `.gitignore` — do not commit secrets). Set at least:
+
+- **Database:** `DATABASE_URL` — PostgreSQL connection string for Prisma (or your hosted DB URL if you use a connection pooler).
+- **HTTP integration:** base URL and bearer/API credentials as required by your deployment. Variable names and defaults are defined where the HTTP client is configured in source (search for `ConfigService` / env keys in the repo).
+
+Run migrations when you change the schema:
+
+```bash
+npx prisma migrate deploy
+```
+
+---
 
 ## Project setup
 
 ```bash
-$ yarn install
+npm install
 ```
 
-## Compile and run the project
+`postinstall` runs **`prisma generate`** so the client is always present after install.
+
+## Run
 
 ```bash
 # development
-$ yarn run start
+npm run start:dev
 
-# watch mode
-$ yarn run start:dev
-
-# production mode
-$ yarn run start:prod
+# production build + run
+npm run build
+npm run start:prod
 ```
 
-## Run tests
+## Tests
 
 ```bash
-# unit tests
-$ yarn run test
-
-# e2e tests
-$ yarn run test:e2e
-
-# test coverage
-$ yarn run test:cov
+npm run test
+npm run test:e2e
+npm run test:cov
 ```
 
-## Resources
+---
 
-Check out a few resources that may come in handy when working with NestJS:
+## Tech stack
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+- **Runtime:** Node.js  
+- **Framework:** NestJS 10  
+- **HTTP client:** `@nestjs/axios`  
+- **Outbound integration:** HTTPS bank catalogue + account resolve (implementation in `src/`)  
+- **Persistence:** Prisma + PostgreSQL (`ResolvedAccount` model)  
+- **Docs:** `@nestjs/swagger` at `/api`  
 
-## Support
+---
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+## Contributing & license
 
-## Stay in touch
+Contributions are welcome: issues and pull requests. Keep secrets out of git and follow the **terms of use and rate limits** of whatever banking API you connect to when testing.
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+This repository’s `package.json` currently declares `"license": "UNLICENSED"`. **If you are open-sourcing publicly**, pick a license (e.g. MIT) and add a `LICENSE` file so others know how they may use the code.
 
-## License
+---
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+## Disclaimer
+
+Bankfinder talks to third-party financial APIs. Accuracy depends on the integration and the account. Use for **automation / internal tools** with care; do not rely on it as the only verification for high-risk money movement without your own checks.

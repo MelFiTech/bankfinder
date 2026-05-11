@@ -4,7 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 
 type ResolveCandidate = {
   code: string;
-  label: string;      // display name
+  label: string;
   isPriority: boolean;
 };
 
@@ -15,15 +15,16 @@ export type ResolveBankAndAccountResult = {
 };
 
 // CBN-assigned 3-digit NUBAN sort code prefixes for commercial and PSB banks.
-// When the prefix matches we put that bank first in the concurrent fan-out so it
-// tends to respond first — but ALL banks fire simultaneously regardless.
+// When the prefix matches we try ONLY that bank — no concurrent fan-out — to
+// prevent fintechs (which sometimes return false positives) from racing against
+// the true owner of a commercial bank account number.
 //
 // MFBs (Kuda, Moniepoint, PalmPay, etc.) use 6-digit CBN codes that don't map
-// cleanly to a 3-digit NUBAN prefix, so they aren't listed here. They sit at the
-// top of the priority queue and are included in every concurrent fan-out anyway.
+// cleanly to a 3-digit NUBAN prefix. They sit at the top of the priority queue
+// and are always included in the full fan-out for unknown-prefix accounts.
 const NUBAN_PREFIX_MAP: Record<string, string> = {
   '044': 'Access Bank Plc',
-  '063': 'Access Bank Plc',            // legacy Diamond Bank sort code
+  '063': 'Access Bank Plc',
   '023': 'Citibank Nigeria Limited',
   '050': 'Ecobank Nigeria Plc',
   '084': 'Ecobank Nigeria Plc',
@@ -51,11 +52,9 @@ const NUBAN_PREFIX_MAP: Record<string, string> = {
   '107': 'Globus Bank',
   '120': 'Optimus Bank',
   '105': 'Parallex Bank Ltd',
-  '327': '9 Payment Service Bank',     // Opay's PSB licence
+  '327': '9 Payment Service Bank',
 };
 
-// Banks most likely to hold an account — tried first in the concurrent fan-out.
-// Order matters only as a tiebreaker when multiple banks respond in the same tick.
 const PRIORITY_BANK_NAMES: readonly string[] = [
   'Opay',
   'Kuda',
@@ -79,7 +78,6 @@ const PRIORITY_BANK_NAMES: readonly string[] = [
   'Unity Bank Plc',
   'Citibank Nigeria Limited',
   'Standard Chartered Bank Nigeria Ltd.',
-  'Stanbic IBTC Bank Plc',
   'Jaiz Bank',
   'Lotus Bank',
   'Titan Trust Bank',
@@ -118,9 +116,8 @@ const PRIORITY_BANK_NAMES: readonly string[] = [
   'ENaira',
 ];
 
-const BANKS_CACHE_TTL_MS = 60 * 60 * 1000;  // 1 hour
-const RESULT_CACHE_TTL_MS = 5 * 60 * 1000;  // 5 minutes
-const RESOLVE_TIMEOUT_MS  = 8_000;           // per individual call
+const BANKS_CACHE_TTL_MS = 60 * 60 * 1000;
+const RESULT_CACHE_TTL_MS = 5 * 60 * 1000;
 
 function normalizeName(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
@@ -130,7 +127,6 @@ function normalizeName(s: string): string {
 export class AccountResolverService implements OnModuleInit {
   private readonly logger = new Logger(AccountResolverService.name);
 
-  // All banks from SME Plug, ordered: priority-matched first, then the rest.
   private candidates: ResolveCandidate[] = [];
   private lastSyncedAt = 0;
 
@@ -158,14 +154,14 @@ export class AccountResolverService implements OnModuleInit {
     const acct = accountNumber?.trim() ?? '';
     if (!acct) return null;
 
-    // 1. In-memory cache (fastest)
+    // 1. In-memory cache
     const cached = this.resultCache.get(acct);
     if (cached && Date.now() < cached.expiresAt) {
       this.logger.log(`Memory cache hit: ${acct}`);
       return cached.result;
     }
 
-    // 2. Persistent DB lookup (fast, survives restarts)
+    // 2. Persistent DB lookup
     try {
       const stored = await this.prismaService.db.resolvedAccount.findUnique({
         where: { accountNumber: acct },
@@ -184,55 +180,84 @@ export class AccountResolverService implements OnModuleInit {
       this.logger.warn(`DB lookup failed for ${acct}: ${err instanceof Error ? err.message : err}`);
     }
 
-    // 3. Live resolution via SME Plug
+    // 3. Live resolution
     await this.syncCandidates(false);
     if (this.candidates.length === 0) return null;
 
+    const result = await this.liveResolve(acct);
+    if (result) this.persist(acct, result);
+    return result;
+  }
+
+  // Manual lookup: user has specified exactly which bank to try.
+  // Resolves, caches and persists so subsequent auto-resolves are instant.
+  async lookupAccountName(
+    bankCode: string,
+    accountNumber: string,
+  ): Promise<{ accountName: string; bankName: string }> {
+    const code = bankCode.trim();
+    const acct = accountNumber.trim();
+
+    const res = await this.smeplug.resolveAccount(code, acct);
+    if (!res.ok || !res.accountName?.trim()) {
+      throw new Error(res.message ?? 'Unable to resolve account name');
+    }
+
+    // Resolve bank name: prefer API response, fall back to our candidates list
+    const bankName =
+      res.bankName?.trim() ||
+      this.candidates.find(c => c.code === code)?.label ||
+      code;
+
+    const result: ResolveBankAndAccountResult = {
+      bankCode: code,
+      bankName,
+      accountName: res.accountName.trim(),
+    };
+
+    // Cache so next auto-resolve returns instantly
+    this.resultCache.set(acct, { result, expiresAt: Date.now() + RESULT_CACHE_TTL_MS });
+    this.persist(acct, result);
+
+    return { accountName: result.accountName, bankName: result.bankName };
+  }
+
+  getBanks(): { code: string; name: string }[] {
+    return [...this.candidates]
+      .map(c => ({ code: c.code, name: c.label }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  // ── Private ────────────────────────────────────────────────────────────────
+
+  private async liveResolve(acct: string): Promise<ResolveBankAndAccountResult | null> {
     const prefix = acct.slice(0, 3);
-    const knownBank = NUBAN_PREFIX_MAP[prefix];
+    const knownBankLabel = NUBAN_PREFIX_MAP[prefix];
 
-    // If the NUBAN prefix identifies the bank definitively, try ONLY that bank.
-    // Firing a concurrent fan-out here would risk a false positive: fintechs like
-    // Opay sometimes return a name for any account number, so if Opay wins the race
-    // against Polaris on a 076xxxxxxx account, we'd return the wrong bank entirely.
-    const candidates = knownBank
-      ? this.candidates.filter(c => c.label === knownBank)
-      : this.candidates;
+    if (knownBankLabel) {
+      // NUBAN prefix is definitive: try only that bank to prevent fintech false positives
+      const target = this.candidates.filter(c => c.label === knownBankLabel);
+      if (target.length > 0) {
+        try {
+          const result = await Promise.any(target.map(c => this.attempt(c, acct)));
+          this.logger.log(`NUBAN prefix resolved ${acct} → ${result.bankName}`);
+          return result;
+        } catch {
+          // Prefix bank didn't match — fall through to full fan-out
+          this.logger.warn(`NUBAN prefix ${prefix} (${knownBankLabel}) gave no result for ${acct}, falling back to full scan`);
+        }
+      }
+    }
 
-    // For unknown prefixes (digital bank accounts), put digital-first banks at the
-    // front so the most likely owner wins the race — but all still fire concurrently.
-    const ordered = knownBank
-      ? candidates
-      : [
-          ...this.candidates.filter(c => c.isPriority),
-          ...this.candidates.filter(c => !c.isPriority),
-        ];
+    // Full concurrent fan-out: priority banks first, then the rest
+    const ordered = [
+      ...this.candidates.filter(c => c.isPriority),
+      ...this.candidates.filter(c => !c.isPriority),
+    ];
 
     try {
-      const result = await Promise.any(
-        ordered.map(candidate => this.attempt(candidate, acct)),
-      );
-
-      // Persist so future lookups skip the API entirely
-      this.prismaService.db.resolvedAccount.upsert({
-        where: { accountNumber: acct },
-        create: {
-          accountNumber: acct,
-          accountName: result.accountName,
-          bankCode: result.bankCode,
-          bankName: result.bankName,
-        },
-        update: {
-          accountName: result.accountName,
-          bankCode: result.bankCode,
-          bankName: result.bankName,
-        },
-      }).catch(err =>
-        this.logger.warn(`DB persist failed: ${err instanceof Error ? err.message : err}`),
-      );
-
-      this.resultCache.set(acct, { result, expiresAt: Date.now() + RESULT_CACHE_TTL_MS });
-      this.logger.log(`Live resolved ${acct} → ${result.bankName}`);
+      const result = await Promise.any(ordered.map(c => this.attempt(c, acct)));
+      this.logger.log(`Fan-out resolved ${acct} → ${result.bankName}`);
       return result;
     } catch {
       this.logger.warn(`No bank resolved for ${acct}`);
@@ -240,22 +265,6 @@ export class AccountResolverService implements OnModuleInit {
     }
   }
 
-  getBanks(): { code: string; name: string }[] {
-    return this.candidates.map(c => ({ code: c.code, name: c.label }));
-  }
-
-  async lookupAccountName(
-    bankCode: string,
-    accountNumber: string,
-  ): Promise<{ accountName: string; bankName: string }> {
-    const res = await this.smeplug.resolveAccount(bankCode.trim(), accountNumber.trim());
-    if (!res.ok || !res.accountName) {
-      throw new Error(res.message ?? 'Unable to resolve account name');
-    }
-    return { accountName: res.accountName, bankName: res.bankName ?? 'Unknown Bank' };
-  }
-
-  // Wraps a single resolveAccount call; throws on miss so Promise.any can skip it.
   private async attempt(
     candidate: ResolveCandidate,
     accountNumber: string,
@@ -271,9 +280,16 @@ export class AccountResolverService implements OnModuleInit {
     throw new Error('no match');
   }
 
-  // Build an ordered candidate list from SME Plug's full bank list.
-  // Priority banks come first (preserving PRIORITY_BANK_NAMES order);
-  // every other bank SME Plug knows about follows so nothing is ever missed.
+  private persist(accountNumber: string, result: ResolveBankAndAccountResult): void {
+    this.prismaService.db.resolvedAccount.upsert({
+      where: { accountNumber },
+      create: { accountNumber, ...result },
+      update: { accountName: result.accountName, bankCode: result.bankCode, bankName: result.bankName },
+    }).catch(err =>
+      this.logger.warn(`DB persist failed: ${err instanceof Error ? err.message : err}`),
+    );
+  }
+
   private async syncCandidates(force: boolean): Promise<void> {
     const now = Date.now();
     if (!force && this.lastSyncedAt > 0 && now - this.lastSyncedAt < BANKS_CACHE_TTL_MS) return;
@@ -285,9 +301,6 @@ export class AccountResolverService implements OnModuleInit {
       this.logger.warn('SME Plug returned empty bank list');
       return;
     }
-
-    const byNorm = new Map<string, SmeplugBank>();
-    for (const b of providerBanks) byNorm.set(normalizeName(b.name), b);
 
     const usedCodes = new Set<string>();
     const priority: ResolveCandidate[] = [];
@@ -302,8 +315,6 @@ export class AccountResolverService implements OnModuleInit {
       }
     }
 
-    // Append every remaining SME Plug bank not already in priority list.
-    // This guarantees we never miss an account just because its bank wasn't named above.
     const rest: ResolveCandidate[] = providerBanks
       .filter(b => !usedCodes.has(b.code))
       .map(b => ({ code: b.code, label: b.name, isPriority: false }));
@@ -322,7 +333,7 @@ export class AccountResolverService implements OnModuleInit {
     for (const b of banks) {
       const n = normalizeName(b.name);
       let score = 0;
-      if (n === target)                          score = 100;
+      if (n === target) score = 100;
       else if (n.includes(target) || target.includes(n)) score = 82;
       else {
         const tw = target.split(' ').filter(w => w.length > 2);
